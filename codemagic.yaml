@@ -1,0 +1,74 @@
+definitions:     
+  env_vars: &env_vars
+    S3_BUCKET_NAME: cmwhitelabel # The name of your S3 bucket that have all of your clients assets.
+    CLIENT_ASSETS_FOLDER: client_assets # The name of unzipped folder on the build machine that have the client assets.
+  scripts:
+    - &get_assets
+      name: Get assets
+      script: |
+        echo "Client ID: ${CLIENT_ID}"
+
+        # curl request to the Contentful API and parse the response with jq to get the url and remove leading double slash from the url.
+        FILE_URL=$(curl --request GET --header "Authorization: Bearer $CONTENTFUL_API_TOKEN" "https://cdn.contentful.com/spaces/${CONTENTFUL_SPACE_ID}/environments/master/assets" | jq '.items[].fields' | jq -r --arg id "assets_$CLIENT_ID" '. | select (.title==$id) | .file.url' | cut -c 3-) 
+
+        # cURL request to download the file to the build machine
+        curl -H "Authorization: Bearer $CONTENTFUL_API_TOKEN" $FILE_URL --output assets.zip
+
+        unzip assets.zip -d $CLIENT_ASSETS_FOLDER
+# Builds will be triggered via REST API with the $CLIENT_ID in the payload
+workflows:  
+  android-client-release:
+    name: Android client release
+    instance_type: mac_mini_m1
+    max_build_duration: 120
+    labels:
+      - ${CLIENT_ID} # Helpful when you open your Codemagic's builds page 
+    environment:
+      groups:
+        - playstore_credentials # Includes (GCLOUD_SERVICE_ACCOUNT_CREDENTIALS) for only validating the intial workflow.
+      vars:
+        <<: *env_vars
+        GOOGLE_PLAY_TRACK: internal # <-- The track you want to publish to in Google Play.
+        GCLOUD_SERVICE_ACCOUNT_CREDENTIALS_HOLDER: $GCLOUD_SERVICE_ACCOUNT_CREDENTIALS # <-- This service account is only for validating the inital workflow, and will not be used to publish the app
+    scripts:
+      # - *get_assets # Getting client assets
+      - name: Set Android environment variables from settings.env
+        script: |
+          source ./$CLIENT_ASSETS_FOLDER/settings.env
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> $CM_ENV
+          echo "CM_KEYSTORE_PASSWORD=$CM_KEYSTORE_PASSWORD" >> $CM_ENV
+          echo "CM_KEY_PASSWORD=$CM_KEY_PASSWORD" >> $CM_ENV
+          echo "CM_KEY_ALIAS=$CM_KEY_ALIAS" >> $CM_ENV
+          echo "CM_KEYSTORE_PATH=$CM_KEYSTORE_PATH" >> $CM_ENV
+          echo 'GCLOUD_SERVICE_ACCOUNT_CREDENTIALS<<DELIMITER' >> $CM_ENV
+          echo "$GCLOUD_SERVICE_ACCOUNT_CREDENTIALS" >> $CM_ENV
+          echo 'DELIMITER' >> $CM_ENV
+      - name: Set Package name
+        script: |
+          flutter pub add change_app_package_name
+          flutter pub run change_app_package_name:main $PACKAGE_NAME
+      - name: Change Android icons
+        script: cp -r ./$CLIENT_ASSETS_FOLDER/$ANDROID_ASSETS_FOLDER/* ./android/app/src/main/res
+      - name: Set main image # An image that being used in this sample project
+        script: cp -r ./$CLIENT_ASSETS_FOLDER/hero.png assets/hero.png
+      - name: Set client id
+        script: cp -r ./$CLIENT_ASSETS_FOLDER/client.env assets/client.env
+      - name: Install dependencies
+        script: flutter packages pub get
+      - name: Flutter build aab and automatic versioning
+        script: |
+          # BUILD_NUMBER=$(($(google-play get-latest-build-number --package-name "$PACKAGE_NAME" --tracks="$GOOGLE_PLAY_TRACK") + 1))
+          BUILD_NUMBER=1
+          flutter build appbundle --release \
+          --build-name=1.0.$BUILD_NUMBER \
+          --build-number=$BUILD_NUMBER
+    artifacts: 
+      - build/**/outputs/**/*.aab
+    # publishing:
+    #   google_play:
+    #     credentials: $GCLOUD_SERVICE_ACCOUNT_CREDENTIALS_HOLDER
+    #     track: $GOOGLE_PLAY_TRACK 
+    #     submit_as_draft: true
+    #   email: 
+    #     recipients:
+    #       - name@mail.com
